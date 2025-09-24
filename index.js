@@ -60,33 +60,141 @@ Query Parameters: ${JSON.stringify(data.query, null, 2)}
     console.log('Endpoint:', endpoint);
     console.log('Raw Data:', data.rawBody || JSON.stringify(data.body));
     
-    // Parse attendance data if available
-    if (data.body && data.body.DATA) {
-        console.log('Parsed Attendance Records:');
-        parseAttendanceData(data.body.DATA);
+    // Parse device data if available
+    if (data.rawBody) {
+        console.log('📊 Parsing Device Data:');
+        const parsedData = parseDeviceData(data.rawBody);
+        
+        // Store parsed data for further processing
+        data.parsedData = parsedData;
+        
+        // Log summary
+        const userCount = parsedData.filter(item => item.type === 'USER').length;
+        const fpCount = parsedData.filter(item => item.type === 'FINGERPRINT').length;
+        const attendanceCount = parsedData.filter(item => item.type === 'ATTENDANCE').length;
+        
+        console.log(`📈 Data Summary: ${userCount} users, ${fpCount} fingerprints, ${attendanceCount} attendance records`);
     }
 }
 
-// Helper function to parse attendance data
-function parseAttendanceData(dataString) {
+// Helper function to parse USER data
+function parseUserData(dataLine) {
     try {
-        const records = dataString.split('\n').filter(line => line.trim().startsWith('RECORD='));
+        const userData = {};
+        const pairs = dataLine.split('\t');
         
-        records.forEach(record => {
-            const parts = record.split('\t');
-            if (parts.length >= 5) {
-                const recordNum = parts[0].replace('RECORD=', '');
-                const userId = parts[1];
-                const timestamp = parts[2];
-                const checkType = parts[3] === '0' ? 'Check-In' : 'Check-Out';
-                const verifyMode = getVerifyMode(parts[4]);
-                
-                console.log(`  Record ${recordNum}: User ${userId} - ${checkType} at ${timestamp} via ${verifyMode}`);
+        pairs.forEach(pair => {
+            const [key, value] = pair.split('=');
+            if (key && value !== undefined) {
+                userData[key.trim()] = value.trim();
             }
         });
+        
+        return {
+            type: 'USER',
+            pin: userData.PIN,
+            name: userData.Name,
+            privilege: userData.Pri,
+            password: userData.Passwd,
+            card: userData.Card,
+            group: userData.Grp,
+            timezone: userData.TZ,
+            expires: userData.Expires,
+            startDatetime: userData.StartDatetime,
+            endDatetime: userData.EndDatetime,
+            validCount: userData.ValidCount
+        };
     } catch (error) {
-        console.log('  Error parsing attendance data:', error.message);
+        console.log('  Error parsing user data:', error.message);
+        return null;
     }
+}
+
+// Helper function to parse fingerprint data
+function parseFingerprintData(dataLine) {
+    try {
+        const fpData = {};
+        const pairs = dataLine.split('\t');
+        
+        pairs.forEach(pair => {
+            const [key, value] = pair.split('=');
+            if (key && value !== undefined) {
+                fpData[key.trim()] = value.trim();
+            }
+        });
+        
+        return {
+            type: 'FINGERPRINT',
+            pin: fpData.PIN,
+            fid: fpData.FID,
+            size: parseInt(fpData.Size),
+            valid: parseInt(fpData.Valid),
+            template: fpData.TMP
+        };
+    } catch (error) {
+        console.log('  Error parsing fingerprint data:', error.message);
+        return null;
+    }
+}
+
+// Helper function to parse attendance records
+function parseAttendanceRecord(dataLine) {
+    try {
+        const parts = dataLine.split('\t');
+        if (parts.length >= 5) {
+            return {
+                type: 'ATTENDANCE',
+                userPin: parts[0],
+                timestamp: parts[1],
+                status: parseInt(parts[2]), // 0=check-in, 1=check-out
+                verifyType: parseInt(parts[3]), // 1=fingerprint, 0=other
+                workCode: parseInt(parts[4]),
+                reserved1: parts[5] || '',
+                reserved2: parts[6] || '',
+                reserved3: parts[7] || '0',
+                reserved4: parts[8] || '0'
+            };
+        }
+        return null;
+    } catch (error) {
+        console.log('  Error parsing attendance record:', error.message);
+        return null;
+    }
+}
+
+// Helper function to parse all data types
+function parseDeviceData(rawData) {
+    const lines = rawData.split('\n').filter(line => line.trim());
+    const parsedData = [];
+    
+    lines.forEach(line => {
+        line = line.trim();
+        
+        if (line.startsWith('USER ')) {
+            const userData = parseUserData(line.substring(5));
+            if (userData) {
+                parsedData.push(userData);
+                console.log(`  📝 User Data: ${userData.name} (PIN: ${userData.pin})`);
+            }
+        } else if (line.startsWith('FP ')) {
+            const fpData = parseFingerprintData(line.substring(3));
+            if (fpData) {
+                parsedData.push(fpData);
+                console.log(`  👆 Fingerprint: PIN ${fpData.pin}, FID ${fpData.fid}, Size ${fpData.size} bytes`);
+            }
+        } else if (line && !line.startsWith('USER') && !line.startsWith('FP')) {
+            // Attendance record
+            const attendanceData = parseAttendanceRecord(line);
+            if (attendanceData) {
+                parsedData.push(attendanceData);
+                const statusText = attendanceData.status === 0 ? 'Check-In' : 'Check-Out';
+                const verifyText = getVerifyMode(attendanceData.verifyType.toString());
+                console.log(`  ⏰ Attendance: User ${attendanceData.userPin} - ${statusText} at ${attendanceData.timestamp} via ${verifyText}`);
+            }
+        }
+    });
+    
+    return parsedData;
 }
 
 // Helper function to get verification mode description
@@ -180,13 +288,56 @@ app.post('/devicecmd', (req, res) => {
     res.status(200).send('OK');
 });
 
+// ESS K90 Pro main data endpoint - /iclock/cdata.aspx
+app.post('/iclock/cdata.aspx', (req, res) => {
+    const clientIP = req.ip || req.connection.remoteAddress || req.socket.remoteAddress;
+    
+    console.log('\n🔔 --- ESS K90 Pro Data Received (iclock/cdata.aspx) ---');
+    
+    // Log the received data
+    logAttendanceData({
+        headers: req.headers,
+        body: req.body,
+        query: req.query,
+        method: req.method,
+        rawBody: req.rawBody
+    }, '/iclock/cdata.aspx', clientIP);
+    
+    // Generate response stamp
+    const responseStamp = Date.now();
+    
+    // Send success response to device (ZKTeco protocol)
+    res.status(200).send(`OK\nSTAMP=${responseStamp}`);
+    
+    console.log(`✅ Response sent: OK STAMP=${responseStamp}`);
+});
+
+// Alternative iclock endpoints (some devices may use variations)
+app.post('/iclock/cdata', (req, res) => {
+    const clientIP = req.ip || req.connection.remoteAddress || req.socket.remoteAddress;
+    
+    console.log('\n🔔 --- ESS K90 Pro Data Received (iclock/cdata) ---');
+    
+    logAttendanceData({
+        headers: req.headers,
+        body: req.body,
+        query: req.query,
+        rawBody: req.rawBody
+    }, '/iclock/cdata', clientIP);
+    
+    const responseStamp = Date.now();
+    res.status(200).send(`OK\nSTAMP=${responseStamp}`);
+    
+    console.log(`✅ Response sent: OK STAMP=${responseStamp}`);
+});
+
 // Health check endpoint
 app.get('/', (req, res) => {
     res.json({
         status: 'ESS K90 Pro Attendance Server Running',
         timestamp: new Date().toISOString(),
         uptime: process.uptime(),
-        endpoints: ['/cdata', '/cdata.php', '/devicecmd'],
+        endpoints: ['/cdata', '/cdata.php', '/devicecmd', '/iclock/cdata.aspx', '/iclock/cdata'],
         logFile: logFile,
         version: '1.0.0'
     });
